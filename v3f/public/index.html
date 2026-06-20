@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>軌道印記 Railway Imprint</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@tabler/icons-webfont@3.10.0/dist/tabler-icons.min.css">
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY=" crossorigin=""/>
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js" integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo=" crossorigin=""></script>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div id="toast" class="toast"></div>
+
+<!-- 模擬刷卡 Modal -->
+<div class="modal-overlay" id="tap-modal">
+  <div class="modal">
+    <button class="modal-x" onclick="closeModal('tap-modal')">✕</button>
+    <div class="modal-title">模擬刷卡</div>
+    <div class="modal-sub">選擇目的地，模擬一次搭乘並觸發積分與印章</div>
+    <select id="tap-station" style="width:100%;padding:10px;border-radius:10px;border:1.5px solid #e0e0e0;font-size:13px;font-family:inherit;margin-bottom:12px;outline:none">
+      <!-- 站點由 JS 動態載入 -->
+    </select>
+    <button class="btn-primary" onclick="doTap()">確認進站</button>
+  </div>
+</div>
+
+<!-- 乘車碼掃描 Modal -->
+<div class="modal-overlay" id="qr-modal">
+  <div class="modal">
+    <button class="modal-x" onclick="closeModal('qr-modal')">✕</button>
+    <div class="modal-title">乘車碼掃描</div>
+    <div class="modal-sub">請將 QR Code 對準掃描框</div>
+    <div class="qr-scanner-box">
+      <div class="qr-scanner-line"></div>
+      <div class="qr-placeholder">
+        <i class="ti ti-qrcode"></i>
+        <span id="qr-status">正在啟動相機...</span>
+      </div>
+    </div>
+    <button class="btn-secondary" onclick="closeModal('qr-modal')">取消</button>
+  </div>
+</div>
+
+<div class="phone">
+
+  <!-- PAGE: AUTH -->
+  <div class="page on" id="page-auth">
+    <div class="auth-bg">
+      <div class="auth-logo">
+        <div class="auth-logo-icon"><i class="ti ti-train"></i></div>
+        <h1>軌道印記</h1>
+        <p>每一趟旅程，都是獨一無二的印記</p>
+      </div>
+      <div class="auth-card">
+        <div class="auth-tab-row">
+          <div class="auth-tab on" id="tab-login" onclick="switchAuthTab('login')">帳號登入辨識</div>
+          <div class="auth-tab" id="tab-register" onclick="switchAuthTab('register')">新旅人註冊</div>
+        </div>
+
+        <div id="form-login">
+          <div class="form-group">
+            <label class="form-label">使用者帳號</label>
+            <input type="text" id="login-username" class="form-input" placeholder="請輸入帳號">
+            <div class="form-error" id="login-username-err"></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">登入密碼</label>
+            <div class="form-input-wrap">
+              <input type="password" id="login-password" class="form-input" placeholder="請輸入密碼">
+              <i class="ti ti-eye-off toggle-pw" onclick="togglePw('login-password', this)"></i>
+            </div>
+            <div class="form-error" id="login-pw-err"></div>
+          </div>
+          <div class="form-error" id="login-global-err" style="margin-bottom:12px"></div>
+          <button class="btn-primary" id="login-btn" onclick="doLogin()"><i class="ti ti-login"></i> 登入</button>
+          <div class="form-divider"><span>或使用測試帳號</span></div>
+          <button class="btn-secondary" onclick="fillTest()">填入測試帳號 (testuser)</button>
+        </div>
+
+        <div id="form-register" style="display:none">
+          <div class="form-group">
+            <label class="form-label">設定帳號</label>
+            <input type="text" id="reg-username" class="form-input" placeholder="登入用 ID">
+            <div class="form-error" id="reg-username-err"></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">旅人顯示名稱</label>
+            <input type="text" id="reg-display" class="form-input" placeholder="例如：鐵道迷小明">
+            <div class="form-error" id="reg-display-err"></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">綁定悠遊卡號 (10碼)</label>
+            <input type="text" id="reg-card" class="form-input" placeholder="卡片背面數字" maxlength="10">
+            <div class="form-error" id="reg-card-err"></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">設定密碼</label>
+            <input type="password" id="reg-password" class="form-input" placeholder="至少 6 個字元">
+            <div class="form-error" id="reg-pw-err"></div>
+          </div>
+          <div class="form-group">
+            <label class="form-label">確認密碼</label>
+            <input type="password" id="reg-confirm" class="form-input" placeholder="再次輸入密碼">
+            <div class="form-error" id="reg-confirm-err"></div>
+          </div>
+          <div class="form-error" id="reg-global-err" style="margin-bottom:12px"></div>
+          <button class="btn-primary" id="register-btn" onclick="doRegister()"><i class="ti ti-user-plus"></i> 建立帳號</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- PAGE: WELCOME -->
+  <div class="page" id="page-welcome">
+    <div class="auth-bg">
+      <div class="welcome-body">
+        <div class="welcome-avatar"><i class="ti ti-user-check"></i></div>
+        <div class="welcome-name" id="w-name">旅人</div>
+        <div class="welcome-sub" id="w-msg">歡迎回來</div>
+        <div class="welcome-card-id"><i class="ti ti-credit-card"></i> <span id="w-card">—</span></div>
+
+        <div class="welcome-stats">
+          <div class="welcome-stat">
+            <div class="welcome-stat-n" id="w-pts">0</div>
+            <div class="welcome-stat-l">累積積分</div>
+          </div>
+          <div class="welcome-stat">
+            <div class="welcome-stat-n" id="w-stamps">0</div>
+            <div class="welcome-stat-l">收集印章</div>
+          </div>
+          <div class="welcome-stat">
+            <div class="welcome-stat-n" id="w-co2">0.0</div>
+            <div class="welcome-stat-l">減碳(kg)</div>
+          </div>
+        </div>
+
+        <button class="btn-primary" onclick="goToApp()">進入系統 <i class="ti ti-arrow-right"></i></button>
+      </div>
+    </div>
+  </div>
+
+  <!-- PAGE: MAIN APP -->
+  <div class="page" id="page-app">
+    <div class="topbar">
+      <div class="topbar-title"><i class="ti ti-train"></i> 軌道印記</div>
+      <div class="topbar-right">
+        <span class="topbar-user" id="topbar-username">—</span>
+        <button class="topbar-logout" onclick="doLogout()">登出</button>
+      </div>
+    </div>
+
+    <!-- SCR: HOME -->
+    <div class="scr on" id="scr-home">
+      <div class="hero-strip">
+        <h2 id="home-greeting">早安，旅人！</h2>
+        <p>今天想去哪裡收集印記呢？</p>
+
+        <div class="tap-card" onclick="openQRScanner()">
+          <div class="tap-pts"><i class="ti ti-qrcode"></i></div>
+          <div>
+            <div style="font-weight:600;font-size:14px">乘車碼掃描</div>
+            <div class="tap-sub">掃描車站 QR Code 快速進站</div>
+          </div>
+          <div class="tap-hint">HOT</div>
+        </div>
+
+        <div class="sim-btn-container" style="display:none">
+          <div class="tap-card" onclick="openModal('tap-modal')" style="margin-top:8px;border-style:solid;background:rgba(255,255,255,.2)">
+            <div class="tap-pts"><i class="ti ti-manual-gearbox"></i></div>
+            <div>
+              <div style="font-weight:600;font-size:14px">模擬進站 (測試)</div>
+              <div class="tap-sub">開發者測試功能</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="stats-row">
+        <div class="stat-c">
+          <div class="stat-n" id="ui-points">0</div>
+          <div class="stat-l">可用積分</div>
+        </div>
+        <div class="stat-c">
+          <div class="stat-n" id="ui-stamp-count">0</div>
+          <div class="stat-l">收集印章</div>
+        </div>
+      </div>
+
+      <div class="sec-label">本月進度</div>
+      <div class="prog-box">
+        <div class="prog-hd">
+          <span class="prog-nm">台鐵縱貫線</span>
+          <span class="prog-cnt" id="prog-tr-cnt">0/25</span>
+        </div>
+        <div class="prog-bg"><div class="prog-fill" id="prog-tr" style="width:0%"></div></div>
+        <div class="prog-hint" id="prog-tr-hint">再集 25 枚可合成「縱貫鐵道大章」</div>
+        <button class="btn-primary" id="craft-btn" onclick="doCraft()" style="margin-top:10px;padding:8px;font-size:12px;display:none">
+          合成縱貫鐵道大章 (+5,000 pts)
+        </button>
+      </div>
+
+      <div class="sec-label" onclick="go('achieve')" style="cursor:pointer;display:flex;justify-content:space-between">任務與成就 <i class="ti ti-chevron-right"></i></div>
+      <div id="home-achievements-preview">
+        <!-- 顯示前 3 個成就 -->
+      </div>
+      <div style="height:20px"></div>
+    </div>
+
+    <!-- SCR: MAP -->
+    <div class="scr" id="scr-map">
+      <div class="map-container-box">
+        <div id="map-leaflet" style="height:350px;width:100%;border-radius:12px;overflow:hidden;box-shadow:inset 0 0 10px rgba(0,0,0,0.1)"></div>
+        <div class="map-overlay-hint">北北基桃台鐵路線圖</div>
+      </div>
+      <div class="sec-label">站點資訊</div>
+      <div id="map-info" class="info-panel">
+        <div style="text-align:center;width:100%;color:#aaa;font-size:12px;padding:10px">點擊地圖上的站點圖示查看詳情</div>
+      </div>
+    </div>
+
+    <!-- SCR: RANK -->
+    <div class="scr" id="scr-rank">
+      <div class="rank-hero">
+        <div style="font-size:40px;margin-bottom:8px">🏆</div>
+        <div style="font-size:20px;font-weight:600">旅人排行榜</div>
+        <div style="font-size:12px;opacity:.8">與全台鐵道迷一較高下</div>
+      </div>
+      <div class="sec-label">積分排名 (TOP 10)</div>
+      <div id="rank-list" class="rank-list-box">
+        <!-- 排行榜動態載入 -->
+      </div>
+      <div style="height:20px"></div>
+    </div>
+
+    <!-- SCR: STAMP -->
+    <div class="scr" id="scr-stamp">
+      <div class="stamp-header">
+        <div style="display:flex;justify-content:space-between;align-items:flex-end">
+          <div>
+            <div style="font-size:11px;opacity:.8">已收集印章</div>
+            <div style="font-size:24px;font-weight:600"><span id="stamp-collected">0</span> <span style="font-size:14px;font-weight:400;opacity:.7">枚</span></div>
+          </div>
+          <div style="font-size:11px;text-align:right">總進度 <span id="stamp-prog-text">0%</span></div>
+        </div>
+        <div class="stamp-prog-bg"><div class="stamp-prog-fill" id="stamp-prog" style="width:0%"></div></div>
+      </div>
+      <div class="sec-label">已解鎖印章</div>
+      <div class="stamp-grid" id="unlocked-grid"></div>
+      <div class="sec-label">尚未發現</div>
+      <div class="stamp-grid" id="locked-grid"></div>
+      <div style="height:20px"></div>
+    </div>
+
+    <!-- SCR: ACHIEVE -->
+    <div class="scr" id="scr-achieve">
+      <div class="achieve-header">
+        <div style="font-size:32px;margin-bottom:8px">🏅</div>
+        <div style="font-size:18px;font-weight:600">成就勳章</div>
+        <div style="font-size:12px;opacity:.8">紀錄你的鐵道冒險里程碑</div>
+      </div>
+      <div class="achieve-grid" id="achieve-grid">
+        <!-- 成就動態載入 -->
+      </div>
+      <div style="height:20px"></div>
+    </div>
+
+    <!-- SCR: PTS -->
+    <div class="scr" id="scr-pts">
+      <div class="pts-hero">
+        <div class="pts-big" id="ui-pts-big">0</div>
+        <div class="pts-sub">目前可用積分</div>
+      </div>
+      <div class="co2-box">
+        <i class="ti ti-leaf"></i>
+        <div style="flex:1">
+          <div class="co2-lbl">累計減碳貢獻</div>
+          <div class="co2-val"><span id="ui-co2">0.0</span> kg</div>
+        </div>
+        <div style="text-align:right">
+          <div class="co2-lbl">搭乘次數</div>
+          <div class="co2-val" id="ui-rides">0</div>
+        </div>
+      </div>
+      <div class="sec-label">積分兌換</div>
+      <div class="redeem-card">
+        <div class="ico">☕</div>
+        <div class="lft"><h4>超商咖啡兌換券</h4><p>200 積分</p></div>
+        <button class="rbtn" onclick="redeem('R001','超商咖啡兌換券')">兌換</button>
+      </div>
+      <div class="redeem-card">
+        <div class="ico">🚌</div>
+        <div class="lft"><h4>公車/捷運折抵</h4><p>100 積分</p></div>
+        <button class="rbtn" onclick="redeem('R002','公車/捷運折抵')">兌換</button>
+      </div>
+      <div style="height:20px"></div>
+    </div>
+
+    <!-- SCR: PROFILE -->
+    <div class="scr" id="scr-profile">
+      <div class="profile-hero">
+        <div class="profile-avatar" id="p-avatar">旅</div>
+        <div style="flex:1">
+          <div class="profile-name" id="p-name">旅人</div>
+          <div class="profile-card-id"><i class="ti ti-credit-card"></i> <span id="p-card">—</span></div>
+          <div class="profile-since" id="p-since">加入時間：2024-01-01</div>
+        </div>
+      </div>
+      <div class="profile-stat-grid">
+        <div class="profile-stat" onclick="go('pts')"><div class="profile-stat-n" id="p-pts">0</div><div class="profile-stat-l">積分</div></div>
+        <div class="profile-stat" onclick="go('stamp')"><div class="profile-stat-n" id="p-stamps">0</div><div class="profile-stat-l">印章</div></div>
+        <div class="profile-stat"><div class="profile-stat-n" id="p-rides">0</div><div class="profile-stat-l">搭乘次數</div></div>
+        <div class="profile-stat"><div class="profile-stat-n" id="p-co2">0.0</div><div class="profile-stat-l">減碳(kg)</div></div>
+      </div>
+      <div class="card" style="padding:16px">
+        <div style="font-size:12px;color:#888;margin-bottom:12px">帳號資訊</div>
+        <div style="font-size:14px;line-height:2">
+          <div>使用者帳號：<strong id="p-username">—</strong></div>
+          <div>悠遊卡號：<strong id="p-card2">—</strong></div>
+          <div>帳號狀態：<span style="color:#27500a;font-weight:500">✓ 已驗證</span></div>
+        </div>
+      </div>
+      <button class="logout-btn" onclick="doLogout()"><i class="ti ti-logout"></i> 登出帳號</button>
+      <div style="height:14px"></div>
+    </div>
+
+    <div class="nav">
+      <div class="nav-item on" id="t-home"    onclick="go('home')"><i class="ti ti-home"></i>首頁</div>
+      <div class="nav-item"    id="t-map"     onclick="go('map')"><i class="ti ti-map-2"></i>地圖</div>
+      <div class="nav-item"    id="t-rank"    onclick="go('rank')"><i class="ti ti-trophy"></i>排行</div>
+      <div class="nav-item"    id="t-stamp"   onclick="go('stamp')"><i class="ti ti-medal"></i>印章</div>
+      <div class="nav-item"    id="t-pts"     onclick="go('pts')"><i class="ti ti-coin"></i>積分</div>
+      <div class="nav-item"    id="t-profile" onclick="go('profile')"><i class="ti ti-user"></i>我的</div>
+    </div>
+  </div>
+
+</div><!-- .phone -->
+
+<script src="js/app.js"></script>
+</body>
+</html>
