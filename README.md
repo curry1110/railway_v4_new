@@ -11,7 +11,9 @@ mysql -u root -p < schema.sql
 # 2. 安裝依賴
 npm install
 
-# 3. 啟動伺服器
+# 3.（選用）設定 Gemini AI 路線規劃，見下方「AI 智慧路線規劃」章節
+
+# 4. 啟動伺服器
 node server.js
 ```
 
@@ -28,7 +30,43 @@ node server.js
 
 ---
 
+## ✨ AI 智慧路線（Gemini）
+
+「推薦路線」頁面共有三處串接 Google Gemini，分工如下：
+
+| 區塊 | 觸發方式 | API | 說明 |
+|------|----------|-----|------|
+| AI 智慧規劃 | 使用者按按鈕主動觸發 | `POST /api/ai-route-plan` | 整合收集進度、上車站、可用時間、個人偏好、進行中任務，請 AI 從零生成一趟完整客製路線 |
+| 智慧推薦路線 | 進入頁面自動背景觸發 | `POST /api/ai-route-insights` | 既有的「依連續未收集區段」規則式推薦不變，AI 只是補上更吸睛的標題與一句話亮點 |
+| 主題路線 | 進入頁面自動背景觸發 | `POST /api/ai-route-insights` | 既有的策展路線與收集進度不變，AI 補上依目前進度的個人化提示（如快集滿了、還缺幾站） |
+
+### 設定步驟
+1. 前往 [Google AI Studio](https://aistudio.google.com/apikey) 免費申請一組 API Key
+2. 開啟 `server.js`，找到以下區塊，把 Key 貼進去：
+   ```js
+   const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'YOUR_GEMINI_API_KEY_HERE';
+   ```
+   或改用環境變數啟動，不需修改程式碼：
+   ```bash
+   GEMINI_API_KEY=你的key node server.js
+   ```
+3. 重新啟動伺服器即可。若未設定 Key，三處 AI 功能都會優雅降級：
+   - AI 智慧規劃按鈕會顯示提醒訊息
+   - 智慧推薦路線／主題路線會維持原本的靜態標題與文案，不影響基本功能
+
+### 運作方式
+- **AI 智慧規劃**（`POST /api/ai-route-plan`）：組合使用者狀態（已/未收集站點、上車站、可用時間、偏好、進行中任務）成 prompt，呼叫 Gemini（`gemini-2.5-flash`，可用 `GEMINI_MODEL` 環境變數更換）並要求以固定 JSON 結構回傳（`responseSchema`），前端顯示 AI 給的標題、推薦理由、依序停靠站點與小提醒
+- **智慧推薦路線／主題路線增強**（`POST /api/ai-route-insights`）：後端重算目前的智慧推薦前 3 段路線、以及尚未集滿的主題路線，整理成精簡 JSON 交給 Gemini，請它針對每一段／每一條補上一句話文案；前端在原本的靜態卡片渲染完成後，於背景非同步呼叫此 API，成功才覆蓋上 AI 文案（卡片上會出現 ✨AI 標籤），失敗則靜默維持原樣，不會卡住畫面或顯示錯誤
+- 兩個 API 都會驗證 AI 回傳的站碼／路線 index／路線 id，過濾掉任何不在目前資料範圍內的內容，避免 AI 幻覺或誤植資料影響系統
+
+---
+
 ## 新功能（v4）
+
+### 🧭 推薦路線：上車站 + 全面 AI 化
+- 可指定今天的「上車站」（或自動定位最近站），系統會依距離調整智慧推薦路線排序
+- 可使用 Gemini AI 從零規劃客製化路線（AI 智慧規劃）
+- 智慧推薦路線、主題路線也都串接 AI，自動補上吸睛標題與個人化提示（詳見上方「AI 智慧路線」）
 
 ### 🔐 模擬進站限定 testuser
 - `POST /api/easycard/simulate-tap` — 後端驗證 session，非 testuser 回傳 403

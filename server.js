@@ -3,9 +3,10 @@ const mysql   = require('mysql2/promise');
 const cors    = require('cors');
 const path    = require('path');
 const crypto  = require('crypto');
+const { createWorker } = require('tesseract.js');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(cors());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -15,6 +16,14 @@ const pool = mysql.createPool({
   database: 'railway_imprint',
   waitForConnections: true, connectionLimit: 10, queueLimit: 0
 });
+
+// ── Gemini AI（AI 路線規劃）──────────────────
+// 1. 至 https://aistudio.google.com/apikey 免費申請一組 API Key
+// 2. 直接貼在下面的字串，或改用環境變數啟動：GEMINI_API_KEY=xxx node server.js
+// 3. 可至 https://ai.google.dev/gemini-api/docs/models 查詢最新可用模型名稱
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY || 'YOUR_GEMINI_API_KEY_HERE';
+const GEMINI_MODEL   = process.env.GEMINI_MODEL   || 'gemini-2.5-flash';
+const GEMINI_ENDPOINT = `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`;
 
 // ── Auth ───────────────────────────────────
 const sessions = new Map();
@@ -66,6 +75,80 @@ const REWARDS = [
   {id:'R003', name:'ESG 綠色護照',   desc:'企業贊助回饋憑證',  cost:500,  icon:'🌿'},
   {id:'R004', name:'北北基桃稀有合成徽章', desc:'集滿傳說章合成',cost:2000, icon:'🏅'},
 ];
+
+// ── 主題推薦路線（靜態策展，提供旅遊靈感）────
+const THEMED_ROUTES = [
+  {id:'KEELUNG_HARBOR', title:'基隆海港半日遊',   desc:'從海港城市出發，探訪縱貫線最北端的傳說站與沿線小站',     icon:'⚓', tag:'親子・海景',     stations:['KEL','SKU','BAD','QDU']},
+  {id:'TAIPEI_URBAN',   title:'雙北都會印章之旅', desc:'穿梭南港、松山到台北，集滿都會核心區印章',               icon:'🏙️', tag:'都會・捷運共構', stations:['NNG','SHS','TPE','WNH','BQO']},
+  {id:'YINGGE_POTTERY', title:'鶯歌陶瓷小旅行',   desc:'山佳車站園區到鶯歌老街，感受百年陶瓷工藝',               icon:'🏺', tag:'文化・老街',     stations:['SJA','YGE']},
+  {id:'TAOYUAN_MINI',   title:'桃園小旅行',       desc:'桃園、內壢到中壢，探索北台灣新興城市風貌',               icon:'🍑', tag:'城市探索',       stations:['TAO','NLI','ZLI']},
+  {id:'REMOTE_HUNTER',  title:'偏鄉秘境探索線',   desc:'七堵、富岡、新富，三座偏遠站一次收錄，額外加碼高額積分', icon:'🗺️', tag:'秘境・高積分',   stations:['QDU','FGA','XFU']},
+  {id:'LEGEND_TOUR',    title:'傳說四城巡禮',     desc:'一次集滿基隆、台北、桃園、中壢四枚傳說印章',             icon:'👑', tag:'傳說章・挑戰',   stations:['KEL','TPE','TAO','ZLI']},
+];
+
+// 站點推薦權重：稀有度 + 偏鄉加碼，分數越高代表越值得優先前往
+function scoreStation(st) {
+  let s = st.base_points;
+  if (st.rarity === 'legendary') s += 600;
+  else if (st.rarity === 'rare')  s += 250;
+  if (st.is_remote) s += 500;
+  return s;
+}
+
+const AVG_SPEED_KMH = 50; // 區間車平均估算時速，用於換算「距上車站預估時間」
+// 計算「從上車站到目的站」的距離／方向／預估時間
+// direction：up = 北上（往基隆方向，里程數變小）；down = 南下（往新富方向，里程數變大）；same = 同一站
+function travelFrom(boardingStation, targetStation) {
+  const distance_km = parseFloat(Math.abs(targetStation.dist_km - boardingStation.dist_km).toFixed(1));
+  const direction = targetStation.dist_km === boardingStation.dist_km ? 'same'
+    : targetStation.dist_km < boardingStation.dist_km ? 'up' : 'down';
+  const est_minutes = distance_km === 0 ? 0 : Math.max(1, Math.round(distance_km / AVG_SPEED_KMH * 60));
+  return { distance_km, direction, est_minutes };
+}
+
+// 將尚未收集的站點依「沿線連續區段」分組，作為一趟可一次走完的建議路線
+// boardingStation（選填）：若提供上車站，會額外標註每段路線距上車站的距離／方向／預估時間，
+// 並讓排序同時考慮「離上車站多近」，而不只是純粹的印章價值分數
+function buildSegments(uncollectedIdSet, boardingStation) {
+  const segments = [];
+  let cur = [];
+  for (const st of STATIONS_LIST) {
+    if (uncollectedIdSet.has(st.id)) {
+      cur.push(st);
+    } else if (cur.length) {
+      segments.push(cur); cur = [];
+    }
+  }
+  if (cur.length) segments.push(cur);
+
+  return segments.map(seg => {
+    const legendary_count = seg.filter(s => s.rarity === 'legendary').length;
+    const rare_count      = seg.filter(s => s.rarity === 'rare').length;
+    const remote_count    = seg.filter(s => s.is_remote).length;
+    const total_points    = seg.reduce((sum, s) => sum + s.base_points + (s.is_remote ? 500 : 0), 0);
+    const distance_km     = parseFloat((seg[seg.length - 1].dist_km - seg[0].dist_km).toFixed(1));
+    const score           = seg.reduce((sum, s) => sum + scoreStation(s), 0);
+
+    let travel = null;
+    if (boardingStation) {
+      const tStart = travelFrom(boardingStation, seg[0]);
+      const tEnd   = travelFrom(boardingStation, seg[seg.length - 1]);
+      const nearer = tStart.distance_km <= tEnd.distance_km ? { st: seg[0], t: tStart } : { st: seg[seg.length - 1], t: tEnd };
+      travel = {
+        nearest_station: nearer.st.name,
+        distance_from_boarding_km: nearer.t.distance_km,
+        est_minutes: nearer.t.est_minutes,
+        direction: nearer.t.direction,
+      };
+    }
+
+    return {
+      from: seg[0].name, to: seg[seg.length - 1].name,
+      stations: seg.map(s => ({ code:s.code, name:s.name, icon:s.icon, rarity:s.rarity, is_remote:s.is_remote, base_points:s.base_points })),
+      count: seg.length, legendary_count, rare_count, remote_count, total_points, distance_km, score, travel,
+    };
+  });
+}
 
 // ── 成就定義（同步 schema）────────────────
 const ACHIEVEMENTS_DEF = [
@@ -411,6 +494,133 @@ function parseTicket(raw) {
   return { valid: false, error: '無法辨識車票格式，請確認是否為台鐵車票 QR Code' };
 }
 
+// ════════════════════════════════════════════
+// TICKET OCR (fallback when QR can't be read/decoded
+// — e.g. real TRA paper tickets use an official encrypted
+// QR payload this system cannot parse, so we read the
+// printed station names instead)
+// ════════════════════════════════════════════
+let ocrWorkerPromise = null;
+function getOcrWorker() {
+  if (!ocrWorkerPromise) {
+    // 使用 npm 套件內建的訓練資料（避免依賴外部 CDN，部署環境網路若有限制也能運作）
+    const langPath = path.join(
+      __dirname, 'node_modules', '@tesseract.js-data', 'chi_tra', '4.0.0_best_int'
+    );
+    ocrWorkerPromise = createWorker('chi_tra', 1, { langPath, cachePath: langPath, gzip: true });
+    // 若初始化失敗，清掉快取的 promise，避免之後每次呼叫都卡在同一個壞掉的 promise 上
+    ocrWorkerPromise.catch(() => { ocrWorkerPromise = null; });
+  }
+  return ocrWorkerPromise;
+}
+
+// 台鐵票面慣用「臺」異體字（如「臺北」），但站名清單採「台」，
+// 比對時正規化成同一字再找，兩邊都能對上。
+function normalizeStationText(s) {
+  return s.replace(/臺/g, '台');
+}
+
+// 每站「去除常見共用字後的辨識度最高字」，OCR 抓不到完整站名時，
+// 用單一不會跟其他站混淆的字當作低信心候選（仍須使用者於畫面上確認，不會自動收集）。
+// 站名中含有與他站重複用字的（如「堵」「汐」「南」「山」「樹」「林」「壢」「富」），不建立單字 fallback。
+const AMBIGUOUS_CHARS = new Set(['堵', '汐', '南', '山', '樹', '林', '壢', '富']);
+function buildUniqueCharIndex() {
+  const idx = {};
+  STATIONS_LIST.forEach(st => {
+    const name = normalizeStationText(st.name);
+    // 用站名最後一個字（台鐵站名慣例上多為辨識度最高的字），且該字不可在 AMBIGUOUS_CHARS 內
+    const lastChar = name[name.length - 1];
+    if (!AMBIGUOUS_CHARS.has(lastChar)) {
+      // 確認沒有其他站名也以同一字結尾，避免誤判
+      const collision = STATIONS_LIST.some(other => other.code !== st.code && normalizeStationText(other.name).endsWith(lastChar));
+      if (!collision) idx[lastChar] = st;
+    }
+  });
+  return idx;
+}
+const UNIQUE_CHAR_INDEX = buildUniqueCharIndex();
+
+// 在辨識出的全文中，依站名「出現位置」找出候選站，
+// 因為台鐵票面慣例是「上面＝出發站、下面＝到達站」，
+// 用文字在原始字串中的 index 排序即可還原順序。
+function matchStationsInText(text) {
+  const clean = normalizeStationText(text.replace(/\s+/g, ''));
+  const hits = [];
+  const matchedCodes = new Set();
+
+  // Tier 1：完整站名比對（高信心）
+  for (const st of STATIONS_LIST) {
+    const idx = clean.indexOf(normalizeStationText(st.name));
+    if (idx !== -1) {
+      hits.push({ ...st, _idx: idx, _confidence: 'full' });
+      matchedCodes.add(st.code);
+    }
+  }
+
+  // Tier 2：完整站名比對不到時，用不易混淆的單字 fallback（低信心，僅作建議）
+  if (hits.length < 2) {
+    for (const [char, st] of Object.entries(UNIQUE_CHAR_INDEX)) {
+      if (matchedCodes.has(st.code)) continue;
+      const idx = clean.indexOf(char);
+      if (idx !== -1) {
+        hits.push({ ...st, _idx: idx, _confidence: 'partial' });
+        matchedCodes.add(st.code);
+      }
+    }
+  }
+
+  hits.sort((a, b) => a._idx - b._idx);
+  return hits;
+}
+
+app.post('/api/ticket/ocr', async (req, res) => {
+  const sess = getSession(req);
+  if (!sess) return res.status(401).json({ detail: '請先登入' });
+
+  const { image_base64 } = req.body;
+  if (!image_base64) return res.status(400).json({ detail: '缺少車票圖片' });
+
+  // 圖片大小防護（base64 約為原檔 1.33 倍，10mb body limit 已留餘裕）
+  let buf;
+  try {
+    const base64Data = image_base64.replace(/^data:image\/\w+;base64,/, '');
+    buf = Buffer.from(base64Data, 'base64');
+    if (buf.length === 0) throw new Error('empty');
+  } catch (_) {
+    return res.status(400).json({ detail: '圖片資料格式錯誤' });
+  }
+
+  try {
+    const worker = await getOcrWorker();
+    const { data } = await worker.recognize(buf);
+    const rawText = data.text || '';
+    const candidates = matchStationsInText(rawText);
+
+    if (candidates.length === 0) {
+      return res.status(404).json({
+        detail: '無法從圖片中辨識出車站名稱，請確認照片清晰、車站名稱完整入鏡，或改用手動輸入車站',
+      });
+    }
+
+    // 票面慣例：上面（先出現）＝出發站，下面（後出現）＝到達站
+    const fromSt = candidates[0];
+    const toSt   = candidates.length > 1 ? candidates[candidates.length - 1] : null;
+    const lowConfidence = candidates.some(c => c._confidence === 'partial');
+
+    res.json({
+      success: true,
+      from: fromSt ? { code: fromSt.code, name: fromSt.name, icon: fromSt.icon } : null,
+      to:   toSt   ? { code: toSt.code,   name: toSt.name,   icon: toSt.icon }   : null,
+      // 只有一站被辨識到時，視為到達站（單純比對到一個站名，無法確定方向）
+      single: candidates.length === 1 ? { code: fromSt.code, name: fromSt.name, icon: fromSt.icon } : null,
+      low_confidence: lowConfidence,
+    });
+  } catch (err) {
+    console.error('OCR error:', err && err.stack ? err.stack : err);
+    res.status(500).json({ detail: 'OCR 辨識發生錯誤，請改用下方「手動輸入車站」' });
+  }
+});
+
 app.post('/api/ticket/validate', async (req, res) => {
   const sess = getSession(req);
   if (!sess) return res.status(401).json({ detail: '請先登入' });
@@ -676,6 +886,446 @@ app.get('/api/qr/:station_code', (req, res) => {
     code: st.code, name: st.name, ts: Date.now()
   })).toString('base64');
   res.json({ station: st, qr_payload: payload, hint: `RI:${st.code}:${Date.now()}` });
+});
+
+// ════════════════════════════════════════════
+// RECOMMENDED ROUTES（推薦路線）
+// ════════════════════════════════════════════
+app.get('/api/recommend-routes', async (req, res) => {
+  const sess = getSession(req);
+  if (!sess) return res.status(401).json({ detail:'請先登入' });
+
+  try {
+    const [userRows] = await pool.query('SELECT * FROM users WHERE id=?', [sess.user_id]);
+    const user = userRows[0];
+    if (!user) return res.status(404).json({ detail:'找不到使用者' });
+
+    const [ownedRows] = await pool.query('SELECT station_id FROM user_stamps WHERE user_id=?', [user.id]);
+    const ownedSet     = new Set(ownedRows.map(r => r.station_id));
+    const uncollected  = STATIONS_LIST.filter(s => !ownedSet.has(s.id));
+
+    // ── 上車站（選填）：使用者可指定今天從哪一站上車，系統會依此調整推薦 ──
+    const boardingCode = (req.query.boarding_station || '').toUpperCase().trim();
+    const boardingStation = boardingCode ? (STATION_BY_CODE[boardingCode] || null) : null;
+    const DIST_PENALTY_PER_KM = 8; // 每公里對推薦分數的懲罰權重，讓「近」與「印章價值高」取得平衡
+
+    // ── 智慧推薦路線：依未收集印章的「連續區段」自動分組 ──
+    let smartRoutes = [];
+    let nextBest = null;
+    if (uncollected.length > 0) {
+      const segs = buildSegments(new Set(uncollected.map(s => s.id)), boardingStation);
+      segs.sort((a, b) => {
+        const aAdj = a.score - (a.travel ? a.travel.distance_from_boarding_km * DIST_PENALTY_PER_KM : 0);
+        const bAdj = b.score - (b.travel ? b.travel.distance_from_boarding_km * DIST_PENALTY_PER_KM : 0);
+        return bAdj - aAdj;
+      });
+      smartRoutes = segs.slice(0, 3).map(seg => {
+        const bonusBits = [];
+        if (seg.legendary_count) bonusBits.push(`含 ${seg.legendary_count} 枚傳說章`);
+        if (seg.rare_count)      bonusBits.push(`${seg.rare_count} 枚稀有章`);
+        if (seg.remote_count)    bonusBits.push(`${seg.remote_count} 個偏鄉加碼站`);
+        const travelBits = seg.travel
+          ? [`距上車站 ${seg.travel.distance_from_boarding_km} km`, `約 ${seg.travel.est_minutes} 分鐘`, seg.travel.direction === 'up' ? '北上方向' : seg.travel.direction === 'down' ? '南下方向' : '就在上車站']
+          : [];
+        return {
+          ...seg,
+          title: seg.count === 1 ? `直奔 ${seg.from}` : `${seg.from} → ${seg.to}`,
+          summary: `${seg.count} 站・最高可得 ${seg.total_points} 積分` + (bonusBits.length ? `・${bonusBits.join('・')}` : ''),
+          travel_summary: travelBits.length ? travelBits.join('・') : null,
+        };
+      });
+
+      let best;
+      if (boardingStation) {
+        best = [...uncollected]
+          .map(s => ({ st: s, t: travelFrom(boardingStation, s), adj: scoreStation(s) - travelFrom(boardingStation, s).distance_km * DIST_PENALTY_PER_KM }))
+          .sort((a, b) => b.adj - a.adj)[0];
+        nextBest = best ? {
+          code: best.st.code, name: best.st.name, icon: best.st.icon, rarity: best.st.rarity,
+          is_remote: best.st.is_remote, points: best.st.base_points + (best.st.is_remote ? 500 : 0),
+          travel: { distance_km: best.t.distance_km, est_minutes: best.t.est_minutes, direction: best.t.direction },
+        } : null;
+      } else {
+        const top = [...uncollected].sort((a, b) => scoreStation(b) - scoreStation(a))[0];
+        nextBest = top ? {
+          code: top.code, name: top.name, icon: top.icon, rarity: top.rarity,
+          is_remote: top.is_remote, points: top.base_points + (top.is_remote ? 500 : 0),
+          travel: null,
+        } : null;
+      }
+    }
+
+    // ── 任務導向路線：把進行中任務轉換成「該去哪幾站」 ──
+    const [missions]  = await pool.query('SELECT * FROM missions WHERE is_active=1 ORDER BY sort_order ASC');
+    const [doneRows]  = await pool.query('SELECT mission_id FROM user_missions WHERE user_id=?', [user.id]);
+    const doneSet     = new Set(doneRows.map(r => r.mission_id));
+    const remoteCodes  = new Set(['QDU','FGA','XFU']);
+    const taoyuanCodes = new Set(['TAO','ZLI','YME']);
+
+    const missionRoutes = [];
+    for (const m of missions) {
+      if (doneSet.has(m.id)) continue;
+      let stations = [];
+      let note = null;
+      switch (m.code) {
+        case 'VISIT_STATION': {
+          const st = STATIONS_LIST.find(s => s.id === m.target_station_id);
+          if (st && !ownedSet.has(st.id)) stations = [st];
+          break;
+        }
+        case 'VISIT_REMOTE':
+          stations = uncollected.filter(s => remoteCodes.has(s.code)).slice(0, 1);
+          if (!stations.length) note = '尚未完成，建議重新確認偏遠站搭乘紀錄';
+          break;
+        case 'KEELUNG_PINGXI':
+          stations = uncollected.filter(s => ['KEL','QDU'].includes(s.code));
+          break;
+        case 'TAOYUAN_REACH':
+          stations = uncollected.filter(s => taoyuanCodes.has(s.code)).slice(0, 1);
+          if (!stations.length) note = '可能已搭乘但任務尚未觸發，建議重新確認';
+          break;
+        case 'STAMPS_5':
+          stations = uncollected.slice(0, 5);
+          note = '完成其中任 5 站皆可達成任務';
+          break;
+        case 'RIDES_5':
+          note = `再搭乘 ${Math.max(0, 5 - user.total_rides)} 次即可完成`; break;
+        case 'RIDES_10':
+          note = `再搭乘 ${Math.max(0, 10 - user.total_rides)} 次即可完成`; break;
+        case 'CARBON_5':
+          note = `再累積 ${Math.max(0, 5 - parseFloat(user.total_carbon_saved || 0)).toFixed(1)} kg 減碳即可完成`; break;
+      }
+      missionRoutes.push({
+        mission_id: m.id, code: m.code, title: m.title, icon: m.icon,
+        points_reward: m.points_reward, is_limited: !!m.is_limited, deadline: m.deadline,
+        stations: stations.map(s => ({ code:s.code, name:s.name, icon:s.icon, rarity:s.rarity, is_remote:s.is_remote })),
+        note,
+      });
+    }
+
+    // ── 主題路線：靜態策展，附上目前收集進度 ──
+    const themedRoutes = THEMED_ROUTES.map(t => {
+      const stationObjs = t.stations.map(code => STATION_BY_CODE[code]);
+      const collected    = stationObjs.filter(s => ownedSet.has(s.id)).length;
+      return {
+        id: t.id, title: t.title, desc: t.desc, icon: t.icon, tag: t.tag,
+        stations: stationObjs.map(s => ({ code:s.code, name:s.name, icon:s.icon, rarity:s.rarity, is_remote:s.is_remote })),
+        collected_count: collected, total: stationObjs.length,
+        all_collected: collected === stationObjs.length,
+      };
+    });
+
+    res.json({
+      total_uncollected: uncollected.length,
+      boarding_station: boardingStation ? { code: boardingStation.code, name: boardingStation.name, icon: boardingStation.icon } : null,
+      next_best: nextBest,
+      smart_routes: smartRoutes,
+      mission_routes: missionRoutes,
+      themed_routes: themedRoutes,
+    });
+  } catch (err) { res.status(500).json({ detail: err.message }); }
+});
+
+// ════════════════════════════════════════════
+// AI 強化：智慧推薦路線 ＋ 主題路線（Gemini）
+// 針對「智慧推薦路線」與「主題路線」兩個區塊，請 AI 補上更吸睛的標題／
+// 一句話推薦理由，前端會以漸進式增強的方式覆蓋在原本的靜態卡片上；
+// 若 AI 服務不可用，前端維持原本的靜態文字，不影響基本功能。
+// ════════════════════════════════════════════
+app.post('/api/ai-route-insights', async (req, res) => {
+  const sess = getSession(req);
+  if (!sess) return res.status(401).json({ detail:'請先登入' });
+
+  if (!GEMINI_API_KEY || GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY_HERE') {
+    return res.status(503).json({ detail:'尚未設定 Gemini API Key' });
+  }
+
+  try {
+    const [userRows] = await pool.query('SELECT * FROM users WHERE id=?', [sess.user_id]);
+    const user = userRows[0];
+    if (!user) return res.status(404).json({ detail:'找不到使用者' });
+
+    const [ownedRows] = await pool.query('SELECT station_id FROM user_stamps WHERE user_id=?', [user.id]);
+    const ownedSet    = new Set(ownedRows.map(r => r.station_id));
+    const uncollected = STATIONS_LIST.filter(s => !ownedSet.has(s.id));
+
+    const boardingCode    = (req.body.boarding_station || '').toString().toUpperCase().trim();
+    const boardingStation = boardingCode ? (STATION_BY_CODE[boardingCode] || null) : null;
+
+    // ── 智慧推薦路線（與 /recommend-routes 相同的前 3 段排序邏輯）──
+    let smartForAi = [];
+    if (uncollected.length > 0) {
+      const DIST_PENALTY_PER_KM = 8;
+      const segs = buildSegments(new Set(uncollected.map(s => s.id)), boardingStation);
+      segs.sort((a, b) => {
+        const aAdj = a.score - (a.travel ? a.travel.distance_from_boarding_km * DIST_PENALTY_PER_KM : 0);
+        const bAdj = b.score - (b.travel ? b.travel.distance_from_boarding_km * DIST_PENALTY_PER_KM : 0);
+        return bAdj - aAdj;
+      });
+      smartForAi = segs.slice(0, 3).map((seg, idx) => ({
+        index: idx,
+        起站: seg.from, 迄站: seg.to, 站數: seg.count, 可得積分: seg.total_points,
+        含傳說章數: seg.legendary_count, 含稀有章數: seg.rare_count, 偏鄉站數: seg.remote_count,
+      }));
+    }
+
+    // ── 主題路線：只挑尚未完成的，附上目前收集進度 ──
+    const themedForAi = THEMED_ROUTES.map(t => {
+      const stationObjs = t.stations.map(code => STATION_BY_CODE[code]);
+      const collected    = stationObjs.filter(s => ownedSet.has(s.id)).length;
+      return { id: t.id, title: t.title, 簡介: t.desc, 已收集: collected, 總站數: stationObjs.length };
+    }).filter(t => t.已收集 < t.總站數);
+
+    if (smartForAi.length === 0 && themedForAi.length === 0) {
+      return res.json({ smart: [], themed: [] });
+    }
+
+    const promptText = `你是台鐵「北北基桃」沿線集章遊戲「軌道印記」的文案顧問。請針對以下兩組路線資料，分別補上更吸引人的一句話文案，幫助使用者更想點進去看。
+
+要求：
+1. 「智慧推薦路線」每一段請補上 ai_title（8字以內，吸睛、像活動標語，可參考起站迄站但不必照搬）與 ai_blurb（1句話，15字以內，說明為何值得去，可提及傳說章／稀有章／偏鄉加碼等亮點）。
+2. 「主題路線」每一條請補上 ai_note（1句話，20字以內，依目前收集進度給予個人化的鼓勵或提示，例如快完成了、還缺幾站等）。
+3. 全程使用繁體中文（台灣用語），語氣活潑親切，不要使用驚嘆號以外的誇張符號。
+4. index 與 id 必須完全對應到輸入資料，不可新增或省略項目。
+
+智慧推薦路線（JSON）：
+${JSON.stringify(smartForAi, null, 2)}
+
+主題路線（JSON）：
+${JSON.stringify(themedForAi, null, 2)}`;
+
+    const responseSchema = {
+      type: 'object',
+      properties: {
+        smart: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              index:    { type: 'integer' },
+              ai_title: { type: 'string' },
+              ai_blurb: { type: 'string' },
+            },
+            required: ['index', 'ai_title', 'ai_blurb'],
+          },
+        },
+        themed: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              id:      { type: 'string' },
+              ai_note: { type: 'string' },
+            },
+            required: ['id', 'ai_note'],
+          },
+        },
+      },
+      required: ['smart', 'themed'],
+    };
+
+    let apiRes;
+    try {
+      apiRes = await fetch(`${GEMINI_ENDPOINT}?key=${GEMINI_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: promptText }] }],
+          generationConfig: { responseMimeType: 'application/json', responseSchema, temperature: 0.9 },
+        }),
+      });
+    } catch (netErr) {
+      return res.status(502).json({ detail:'無法連線至 Gemini AI 服務' });
+    }
+
+    if (!apiRes.ok) {
+      const errText = await apiRes.text().catch(() => '');
+      console.error('Gemini API error (route-insights):', apiRes.status, errText);
+      return res.status(502).json({ detail:`AI 服務暫時無法使用（${apiRes.status}）` });
+    }
+
+    const apiData = await apiRes.json();
+    const rawText = apiData?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) return res.status(502).json({ detail:'AI 未回傳有效內容' });
+
+    let plan;
+    try { plan = JSON.parse(rawText); }
+    catch { return res.status(502).json({ detail:'AI 回應格式錯誤' }); }
+
+    // ── 驗證：index 必須落在範圍內、id 必須存在於主題路線清單，避免幻覺資料 ──
+    const validSmartIdx = new Set(smartForAi.map(s => s.index));
+    const themedIdSet   = new Set(themedForAi.map(t => t.id));
+
+    const smart = (Array.isArray(plan.smart) ? plan.smart : [])
+      .filter(s => s && Number.isInteger(s.index) && validSmartIdx.has(s.index))
+      .map(s => ({
+        index: s.index,
+        ai_title: (s.ai_title || '').toString().slice(0, 30),
+        ai_blurb: (s.ai_blurb || '').toString().slice(0, 60),
+      }));
+
+    const themed = (Array.isArray(plan.themed) ? plan.themed : [])
+      .filter(t => t && typeof t.id === 'string' && themedIdSet.has(t.id))
+      .map(t => ({ id: t.id, ai_note: (t.ai_note || '').toString().slice(0, 60) }));
+
+    res.json({ smart, themed });
+  } catch (err) {
+    console.error('AI route insights error:', err);
+    res.status(500).json({ detail: err.message });
+  }
+});
+
+// ════════════════════════════════════════════
+// AI 智慧路線規劃（Gemini）
+// ════════════════════════════════════════════
+app.post('/api/ai-route-plan', async (req, res) => {
+  const sess = getSession(req);
+  if (!sess) return res.status(401).json({ detail:'請先登入' });
+
+  if (!GEMINI_API_KEY || GEMINI_API_KEY === 'YOUR_GEMINI_API_KEY_HERE') {
+    return res.status(503).json({ detail:'尚未設定 Gemini API Key，請參考 README 設定教學申請並填入後端設定' });
+  }
+
+  try {
+    const [userRows] = await pool.query('SELECT * FROM users WHERE id=?', [sess.user_id]);
+    const user = userRows[0];
+    if (!user) return res.status(404).json({ detail:'找不到使用者' });
+
+    const [ownedRows] = await pool.query('SELECT station_id FROM user_stamps WHERE user_id=?', [user.id]);
+    const ownedSet    = new Set(ownedRows.map(r => r.station_id));
+    const uncollected = STATIONS_LIST.filter(s => !ownedSet.has(s.id));
+    if (uncollected.length === 0) {
+      return res.json({ all_collected: true });
+    }
+
+    const boardingCode    = (req.body.boarding_station || '').toString().toUpperCase().trim();
+    const boardingStation = boardingCode ? (STATION_BY_CODE[boardingCode] || null) : null;
+    const timeBudgetRaw    = parseInt(req.body.time_budget_minutes, 10);
+    const timeBudget       = Number.isFinite(timeBudgetRaw) && timeBudgetRaw > 0 ? timeBudgetRaw : null;
+    const preference       = (req.body.preference || '').toString().trim().slice(0, 100); // 限制長度，降低 prompt injection 風險
+
+    const [missions] = await pool.query('SELECT * FROM missions WHERE is_active=1 ORDER BY sort_order ASC');
+    const [doneRows] = await pool.query('SELECT mission_id FROM user_missions WHERE user_id=?', [user.id]);
+    const doneSet     = new Set(doneRows.map(r => r.mission_id));
+    const activeMissions = missions.filter(m => !doneSet.has(m.id))
+      .map(m => ({ 任務: m.title, 說明: m.description, 獎勵積分: m.points_reward }));
+
+    const stateForAi = {
+      已收集站點: STATIONS_LIST.filter(s => ownedSet.has(s.id)).map(s => s.name),
+      尚未收集站點: uncollected.map(s => ({
+        站碼: s.code, 名稱: s.name, 稀有度: s.rarity, 是否偏遠站: s.is_remote, 沿線里程km: s.dist_km, 基本積分: s.base_points,
+      })),
+      今日上車站: boardingStation ? boardingStation.name : '未指定',
+      可用時間分鐘: timeBudget || '未指定',
+      使用者偏好: preference || '無特別偏好',
+      進行中任務: activeMissions,
+      使用者統計: { 累計搭乘次數: user.total_rides, 累計積分: user.total_points, 累計減碳公斤: user.total_carbon_saved },
+    };
+
+    const promptText = `你是台鐵「北北基桃」沿線集章遊戲「軌道印記」的路線規劃顧問。請根據以下使用者狀態，規劃一趟今天適合的集章路線。
+
+規則：
+1. stops 只能從「尚未收集站點」清單中挑選，不可挑選已收集站點，station_code 必須完全等於清單中的「站碼」欄位，不可自行創造站碼。
+2. 若「今日上車站」非「未指定」，請優先安排距離該站較近、方向順路（同一方向，避免來回折返）的站點。
+3. 若「可用時間分鐘」非「未指定」，請估算路線所需時間（全線平均時速約 50 km/h）不超過此時間。
+4. 若「使用者偏好」非「無特別偏好」，請納入考量並回應在 narrative 或 tip；若偏好內容與路線規劃無關或不合理，可忽略。
+5. 優先考慮稀有度高（legendary > rare > common）與偏遠站（是否偏遠站）的站點，因為集章與積分價值較高，但仍須兼顧路線合理性。
+6. 可參考「進行中任務」，若安排的站點恰好能完成任務，可在 narrative 或 tip 提及。
+7. stops 建議安排 2 到 5 站，不要過多造成負擔；若使用者已幾乎集滿，可少於 2 站。
+8. 全程使用繁體中文（台灣用語），語氣親切、像在地朋友報路線。
+
+使用者狀態（JSON）：
+${JSON.stringify(stateForAi, null, 2)}`;
+
+    const responseSchema = {
+      type: 'object',
+      properties: {
+        title:     { type: 'string', description: '這趟路線的吸引人標題，15 字以內' },
+        narrative: { type: 'string', description: '用親切鼓勵的語氣說明為什麼推薦這個路線，2-4 句話' },
+        stops: {
+          type: 'array',
+          description: '建議依序造訪的站點，依台鐵縱貫線實際方向排序',
+          items: {
+            type: 'object',
+            properties: {
+              station_code: { type: 'string', description: '必須完全等於「尚未收集站點」清單中的站碼' },
+              station_name: { type: 'string' },
+              reason:       { type: 'string', description: '為什麼推薦造訪這一站，1 句話' },
+            },
+            required: ['station_code', 'station_name', 'reason'],
+          },
+        },
+        total_distance_km: { type: 'number', description: '路線總里程估算（公里）' },
+        estimated_minutes: { type: 'number', description: '路線所需時間估算（分鐘）' },
+        tip: { type: 'string', description: '一句旅行小提醒或集章策略建議' },
+      },
+      required: ['title', 'narrative', 'stops', 'tip'],
+    };
+
+    let apiRes;
+    try {
+      apiRes = await fetch(`${GEMINI_ENDPOINT}?key=${GEMINI_API_KEY}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          contents: [{ role: 'user', parts: [{ text: promptText }] }],
+          generationConfig: { responseMimeType: 'application/json', responseSchema, temperature: 0.8 },
+        }),
+      });
+    } catch (netErr) {
+      return res.status(502).json({ detail:'無法連線至 Gemini AI 服務，請檢查網路連線' });
+    }
+
+    if (!apiRes.ok) {
+      const errText = await apiRes.text().catch(() => '');
+      console.error('Gemini API error:', apiRes.status, errText);
+      const msg = apiRes.status === 400 ? 'Gemini API Key 或設定有誤'
+        : apiRes.status === 403 ? 'Gemini API Key 無效或無權限'
+        : apiRes.status === 429 ? 'AI 服務目前請求過多，請稍後再試'
+        : `AI 服務暫時無法使用（${apiRes.status}）`;
+      return res.status(502).json({ detail: msg });
+    }
+
+    const apiData = await apiRes.json();
+    const rawText = apiData?.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) return res.status(502).json({ detail:'AI 未回傳有效內容，請稍後再試' });
+
+    let plan;
+    try { plan = JSON.parse(rawText); }
+    catch { return res.status(502).json({ detail:'AI 回應格式錯誤，請再試一次' }); }
+
+    // ── 驗證 AI 回傳的站點，過濾掉幻覺站碼或已收集站點，確保前端資料一定可信 ──
+    const uncollectedCodes = new Set(uncollected.map(s => s.code));
+    const validStops = (Array.isArray(plan.stops) ? plan.stops : [])
+      .filter(s => s && typeof s.station_code === 'string' && uncollectedCodes.has(s.station_code.toUpperCase()))
+      .map(s => {
+        const st = STATION_BY_CODE[s.station_code.toUpperCase()];
+        return {
+          code: st.code, name: st.name, icon: st.icon, rarity: st.rarity, is_remote: st.is_remote,
+          base_points: st.base_points, reason: (s.reason || '').toString().slice(0, 120),
+        };
+      });
+
+    if (validStops.length === 0) {
+      return res.status(502).json({ detail:'AI 規劃的站點無法對應到目前未收集的站點，請再試一次' });
+    }
+
+    const total_points = validStops.reduce((sum, s) => sum + s.base_points + (s.is_remote ? 500 : 0), 0);
+
+    res.json({
+      title: (plan.title || 'AI 推薦路線').toString().slice(0, 40),
+      narrative: (plan.narrative || '').toString().slice(0, 300),
+      tip: (plan.tip || '').toString().slice(0, 200),
+      stops: validStops,
+      total_points,
+      total_distance_km: typeof plan.total_distance_km === 'number' ? plan.total_distance_km : null,
+      estimated_minutes: typeof plan.estimated_minutes === 'number' ? plan.estimated_minutes : null,
+      boarding_station: boardingStation ? { code: boardingStation.code, name: boardingStation.name, icon: boardingStation.icon } : null,
+    });
+  } catch (err) {
+    console.error('AI route plan error:', err);
+    res.status(500).json({ detail: err.message });
+  }
 });
 
 // SPA fallback

@@ -76,7 +76,7 @@
   <div class="modal">
     <button class="modal-x" onclick="closeScanModal()">✕</button>
     <div class="modal-title">📷 掃描車票</div>
-    <div class="modal-sub">掃描車票上的 QR Code 來收集站點印記</div>
+    <div class="modal-sub">掃描車票 QR Code 收集站點印記；無法辨識時會自動改用文字辨識，或可手動輸入車站</div>
 
     <!-- 掃描方式切換 -->
     <div style="display:flex;gap:8px;margin-bottom:14px">
@@ -107,6 +107,9 @@
       <button id="scan-stop-btn" class="btn-secondary" onclick="stopCameraScan()" style="display:none">
         <i class="ti ti-player-stop"></i> 停止掃描
       </button>
+      <button id="scan-capture-ocr-btn" class="btn-secondary" onclick="captureFrameForOCR()" style="display:none;margin-top:8px">
+        <i class="ti ti-photo-search"></i> 找不到 QR？拍照辨識文字
+      </button>
     </div>
 
     <!-- 上傳圖片區 -->
@@ -117,6 +120,29 @@
         <input id="scan-file-input" type="file" accept="image/*" style="display:none" onchange="handleTicketUpload(event)">
       </label>
       <canvas id="scan-upload-canvas" style="display:none"></canvas>
+    </div>
+
+    <!-- 手動輸入備用方案（真實台鐵票 QR 為官方加密格式，本系統無法解析，請改用此方式） -->
+    <div id="scan-manual-section" style="margin-bottom:12px">
+      <button id="scan-manual-toggle" onclick="toggleManualEntry()" style="width:100%;background:none;border:none;color:#0d2b6e;font-size:12px;font-weight:600;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:5px;padding:6px">
+        <i class="ti ti-keyboard"></i> 掃不到嗎？改用手動輸入車站
+      </button>
+      <div id="scan-manual-form" style="display:none;background:#f7f8fc;border-radius:12px;padding:14px;margin-top:8px">
+        <div style="font-size:11px;color:#888;margin-bottom:10px;line-height:1.5">
+          台鐵紙本車票的 QR Code 是台鐵官方加密格式，本系統無法直接解析。請手動選擇到達站完成集章。
+        </div>
+        <label style="display:block;font-size:12px;color:#555;margin-bottom:4px">到達站</label>
+        <select id="scan-manual-station" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:13px;font-family:inherit;margin-bottom:10px;background:#fff">
+          <option value="">請選擇車站…</option>
+        </select>
+        <label style="display:block;font-size:12px;color:#555;margin-bottom:4px">出發站（選填）</label>
+        <select id="scan-manual-from" style="width:100%;padding:10px;border:1px solid #ddd;border-radius:8px;font-size:13px;font-family:inherit;margin-bottom:12px;background:#fff">
+          <option value="">不指定</option>
+        </select>
+        <button class="btn-primary" onclick="submitManualEntry()">
+          <i class="ti ti-stamp"></i> 確認車站
+        </button>
+      </div>
     </div>
 
     <!-- 結果區 -->
@@ -299,6 +325,9 @@
         <button onclick="openModal('scan-modal')" style="width:100%;margin-top:10px;padding:12px;background:rgba(255,255,255,0.18);color:#fff;border:1.5px solid rgba(255,255,255,0.45);border-radius:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:7px;backdrop-filter:blur(4px)">
           <i class="ti ti-scan" style="font-size:17px"></i> 掃描車票收集印記
         </button>
+        <button onclick="go('route')" style="width:100%;margin-top:8px;padding:12px;background:rgba(255,255,255,0.1);color:#fff;border:1.5px solid rgba(255,255,255,0.3);border-radius:12px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;display:flex;align-items:center;justify-content:center;gap:7px">
+          <i class="ti ti-route" style="font-size:17px"></i> 看看今天適合去哪一站
+        </button>
       </div>
 
       <div class="stats-row">
@@ -345,6 +374,66 @@
           點選地圖上的站點<br>查看印章資訊與乘車功能
         </div>
       </div>
+      <div style="height:14px"></div>
+    </div>
+
+    <!-- ── 推薦路線 ── -->
+    <div class="scr" id="scr-route">
+      <div class="hero-strip" style="padding-bottom:14px">
+        <h2>🧭 推薦路線</h2>
+        <p>依你的收集進度，為你規劃下一趟旅程</p>
+      </div>
+
+      <div class="route-board-box">
+        <div class="route-board-row">
+          <i class="ti ti-map-pin-filled" style="color:#1a5fb4;font-size:16px"></i>
+          <span class="route-board-lbl">上車站</span>
+          <select id="route-boarding-select" class="route-board-select" onchange="onBoardingStationChange()">
+            <option value="">不指定（依收集進度推薦）</option>
+          </select>
+          <button id="route-board-locate" class="route-board-locate" onclick="locateNearestBoardingStation()" title="定位最近站">
+            <i class="ti ti-current-location"></i>
+          </button>
+        </div>
+        <div id="route-board-hint" class="route-board-hint"></div>
+      </div>
+
+      <div class="sec-label">✨ AI 智慧規劃（Gemini）</div>
+      <div class="ai-route-box">
+        <div class="ai-route-row">
+          <select id="ai-time-budget" class="ai-route-select">
+            <option value="">不限時間</option>
+            <option value="30">約 30 分鐘</option>
+            <option value="60">約 1 小時</option>
+            <option value="120">約 2 小時</option>
+            <option value="240">半天（4 小時）</option>
+          </select>
+        </div>
+        <input id="ai-preference-input" class="ai-route-input" type="text" maxlength="80"
+               placeholder="想要怎樣的一趟旅程？（選填，例如：想拍美照、想吃在地小吃）">
+        <button id="ai-route-btn" class="btn-primary" style="margin-top:10px" onclick="requestAiRoutePlan()">
+          <i class="ti ti-sparkles"></i> 請 AI 幫我規劃路線
+        </button>
+        <div id="ai-route-result"></div>
+      </div>
+
+      <div id="route-next-best"></div>
+
+      <div class="sec-label">智慧推薦路線 <span style="font-size:10px;color:#7a3fd6;font-weight:400">✨ AI 補上推薦理由</span></div>
+      <div id="route-smart-list">
+        <div style="text-align:center;padding:20px;color:#aaa;font-size:12px">載入中...</div>
+      </div>
+
+      <div class="sec-label">任務導向路線</div>
+      <div id="route-mission-list">
+        <div style="text-align:center;padding:20px;color:#aaa;font-size:12px">載入中...</div>
+      </div>
+
+      <div class="sec-label">主題路線 <span style="font-size:10px;color:#7a3fd6;font-weight:400">✨ AI 補上個人化提示</span></div>
+      <div id="route-themed-list">
+        <div style="text-align:center;padding:20px;color:#aaa;font-size:12px">載入中...</div>
+      </div>
+
       <div style="height:14px"></div>
     </div>
 
@@ -511,6 +600,7 @@
     <div class="nav">
       <div class="nav-item on" id="t-home"    onclick="go('home')">   <i class="ti ti-home"></i>首頁</div>
       <div class="nav-item"    id="t-map"     onclick="go('map')">    <i class="ti ti-map-2"></i>地圖</div>
+      <div class="nav-item"    id="t-route"   onclick="go('route')"> <i class="ti ti-route"></i>路線</div>
       <div class="nav-item"    id="t-stamp"   onclick="go('stamp')">  <i class="ti ti-medal"></i>印章</div>
       <div class="nav-item"    id="t-mission" onclick="go('mission')"><i class="ti ti-target"></i>任務</div>
       <div class="nav-item"    id="t-achieve" onclick="go('achieve')"><i class="ti ti-trophy"></i>成就</div>

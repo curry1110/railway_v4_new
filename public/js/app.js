@@ -51,6 +51,7 @@ function go(id) {
   document.getElementById('scr-' + id)?.classList.add('on');
   document.getElementById('t-' + id)?.classList.add('on');
   if (id === 'map')     initLeafletMap();
+  if (id === 'route')   loadRecommendRoutes();
   if (id === 'rank')    loadLeaderboard();
   if (id === 'achieve') loadAchievements();
   if (id === 'mission') loadMissions();
@@ -521,6 +522,306 @@ function missionHTML(m) {
 }
 
 // ═══════════════════════════════════════════
+// Recommended Routes（推薦路線）
+// ═══════════════════════════════════════════
+let boardingStationCode = localStorage.getItem('ri_boarding_station') || '';
+let routeStationsCache  = null; // 快取 /api/stations 結果，供上車站選單 / 定位使用
+
+async function ensureRouteStationsCache() {
+  if (routeStationsCache) return routeStationsCache;
+  const data = await apiFetch('/stations');
+  routeStationsCache = data.stations || [];
+  return routeStationsCache;
+}
+
+function populateBoardingSelect(stations) {
+  const sel = document.getElementById('route-boarding-select');
+  if (!sel || sel.dataset.filled === '1') return;
+  const opts = stations.map(st => `<option value="${st.code}">${st.icon || '🚉'} ${st.name}</option>`).join('');
+  sel.insertAdjacentHTML('beforeend', opts);
+  sel.dataset.filled = '1';
+}
+
+function onBoardingStationChange() {
+  const sel = document.getElementById('route-boarding-select');
+  boardingStationCode = sel ? sel.value : '';
+  localStorage.setItem('ri_boarding_station', boardingStationCode);
+  loadRecommendRoutes();
+}
+
+function haversineKm(lat1, lng1, lat2, lng2) {
+  const R = 6371, toRad = d => d * Math.PI / 180;
+  const dLat = toRad(lat2 - lat1), dLng = toRad(lng2 - lng1);
+  const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLng/2)**2;
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+async function locateNearestBoardingStation() {
+  if (!navigator.geolocation) { showToast('此裝置不支援定位', false); return; }
+  const stations = await ensureRouteStationsCache();
+  navigator.geolocation.getCurrentPosition(
+    (pos) => {
+      const { latitude, longitude } = pos.coords;
+      let nearest = null, minDist = Infinity;
+      stations.forEach(st => {
+        const d = haversineKm(latitude, longitude, st.lat, st.lng);
+        if (d < minDist) { minDist = d; nearest = st; }
+      });
+      if (!nearest) return;
+      const sel = document.getElementById('route-boarding-select');
+      if (sel) sel.value = nearest.code;
+      boardingStationCode = nearest.code;
+      localStorage.setItem('ri_boarding_station', boardingStationCode);
+      showToast(`已定位至最近站：${nearest.name}`);
+      loadRecommendRoutes();
+    },
+    () => showToast('無法取得定位，請改用下拉選單手動選擇', false),
+    { enableHighAccuracy: false, timeout: 8000 }
+  );
+}
+
+async function loadRecommendRoutes() {
+  const stations = await ensureRouteStationsCache();
+  populateBoardingSelect(stations);
+  const sel = document.getElementById('route-boarding-select');
+  if (sel) sel.value = boardingStationCode;
+
+  const qs = boardingStationCode ? `?boarding_station=${encodeURIComponent(boardingStationCode)}` : '';
+  const data = await apiFetch('/recommend-routes' + qs);
+  if (data.detail) {
+    document.getElementById('route-next-best').innerHTML = '';
+    document.getElementById('route-smart-list').innerHTML =
+      `<div style="text-align:center;padding:20px;color:#aaa;font-size:12px">${data.detail}</div>`;
+    document.getElementById('route-mission-list').innerHTML = '';
+    document.getElementById('route-themed-list').innerHTML = '';
+    return;
+  }
+  const hint = document.getElementById('route-board-hint');
+  if (hint) {
+    hint.textContent = data.boarding_station
+      ? `已依「${data.boarding_station.icon || ''} ${data.boarding_station.name}」上車，優先推薦距離近、又值得收集的站點`
+      : '選擇上車站，系統會優先推薦離你較近的路線；或點右側圖示自動定位最近站';
+  }
+  renderNextBest(data.next_best, data.total_uncollected);
+  renderSmartRoutes(data.smart_routes, data.total_uncollected);
+  renderMissionRoutes(data.mission_routes);
+  renderThemedRoutes(data.themed_routes);
+
+  // 背景請求 AI 文案增強（智慧推薦路線／主題路線），不阻塞原本的靜態列表；
+  // 若 AI 服務未設定或失敗，靜態文字會原樣保留。
+  loadAiRouteEnrichment();
+}
+
+async function loadAiRouteEnrichment() {
+  const data = await apiFetch('/ai-route-insights', {
+    method: 'POST',
+    body: JSON.stringify({ boarding_station: boardingStationCode || '' }),
+  });
+  if (!data || data.detail) return; // 靜默失敗，保留原本靜態文案
+
+  (data.smart || []).forEach(s => {
+    const card = document.querySelector(`#route-smart-list [data-smart-idx="${s.index}"]`);
+    if (!card) return;
+    const titleEl = card.querySelector('.route-card-title');
+    if (titleEl && s.ai_title) {
+      titleEl.innerHTML = `<span class="ai-tag">✨AI</span> ${s.ai_title}`;
+    }
+    if (s.ai_blurb) {
+      const blurb = document.createElement('div');
+      blurb.className = 'route-card-ai-blurb';
+      blurb.textContent = `💡 ${s.ai_blurb}`;
+      card.appendChild(blurb);
+    }
+  });
+
+  (data.themed || []).forEach(t => {
+    const card = document.querySelector(`#route-themed-list [data-themed-id="${t.id}"]`);
+    if (!card || !t.ai_note) return;
+    const note = document.createElement('div');
+    note.className = 'route-themed-ai-note';
+    note.innerHTML = `<span class="ai-tag">✨AI</span> ${t.ai_note}`;
+    card.appendChild(note);
+  });
+}
+
+function stationChip(st) {
+  let cls = '';
+  if (st.rarity === 'legendary') cls = 'r-legend';
+  else if (st.rarity === 'rare') cls = 'r-rare';
+  if (st.is_remote) cls += ' r-remote';
+  return `<span class="route-chip ${cls}">${st.icon} ${st.name}</span>`;
+}
+
+// ═══════════════════════════════════════════
+// AI 智慧路線規劃（Gemini）
+// ═══════════════════════════════════════════
+async function requestAiRoutePlan() {
+  const btn        = document.getElementById('ai-route-btn');
+  const resultBox  = document.getElementById('ai-route-result');
+  const timeBudget = document.getElementById('ai-time-budget')?.value || '';
+  const preference = document.getElementById('ai-preference-input')?.value?.trim() || '';
+  if (!btn || !resultBox) return;
+
+  btn.disabled = true;
+  btn.innerHTML = '<div class="spinner"></div> AI 規劃中…';
+  resultBox.innerHTML = '';
+
+  const data = await apiFetch('/ai-route-plan', {
+    method: 'POST',
+    body: JSON.stringify({
+      boarding_station: boardingStationCode || '',
+      time_budget_minutes: timeBudget,
+      preference,
+    }),
+  });
+
+  renderAiRoutePlan(data);
+
+  btn.disabled = false;
+  btn.innerHTML = '<i class="ti ti-sparkles"></i> 請 AI 幫我規劃路線';
+}
+
+function renderAiRoutePlan(data) {
+  const box = document.getElementById('ai-route-result');
+  if (!box) return;
+
+  if (data.all_collected) {
+    box.innerHTML = `<div class="ai-route-error" style="color:#27500a;background:#eaf3de">🎉 你已收集所有站點，沒有需要規劃的路線囉！</div>`;
+    return;
+  }
+  if (data.detail) {
+    box.innerHTML = `<div class="ai-route-error">⚠️ ${data.detail}</div>`;
+    return;
+  }
+  if (!data.stops || !data.stops.length) {
+    box.innerHTML = `<div class="ai-route-error">AI 暫時無法規劃路線，請稍後再試</div>`;
+    return;
+  }
+
+  const metaBits = [];
+  if (data.total_distance_km) metaBits.push(`約 ${data.total_distance_km} km`);
+  if (data.estimated_minutes) metaBits.push(`約 ${data.estimated_minutes} 分鐘`);
+  metaBits.push(`+${data.total_points} 積分`);
+
+  const stopsHtml = data.stops.map((s, i) => `
+    <div class="ai-route-stop">
+      <div class="ai-route-stop-no">${i + 1}</div>
+      <div style="flex:1">
+        ${stationChip(s)}
+        ${s.reason ? `<div class="ai-route-stop-reason">${s.reason}</div>` : ''}
+      </div>
+    </div>
+  `).join('');
+
+  box.innerHTML = `
+    <div class="ai-route-card">
+      <div class="ai-route-card-title">✨ ${data.title}</div>
+      <div class="ai-route-card-narrative">${data.narrative}</div>
+      <div class="ai-route-card-meta">${metaBits.join('・')}</div>
+      <div class="ai-route-stops">${stopsHtml}</div>
+      ${data.tip ? `<div class="ai-route-tip">💡 ${data.tip}</div>` : ''}
+    </div>
+  `;
+}
+
+function directionLabel(dir) {
+  return dir === 'up' ? '北上方向' : dir === 'down' ? '南下方向' : dir === 'same' ? '就在上車站' : '';
+}
+
+function renderNextBest(best, totalUncollected) {
+  const box = document.getElementById('route-next-best');
+  if (!best) {
+    box.innerHTML = totalUncollected === 0
+      ? `<div class="route-best-card">
+           <div class="route-best-icon">👑</div>
+           <div>
+             <div class="route-best-lbl">恭喜</div>
+             <div class="route-best-name">25 枚印章已全數收集！</div>
+             <div class="route-best-sub">你是真正的北北基桃鐵道達人</div>
+           </div>
+         </div>`
+      : '';
+    return;
+  }
+  const travelLine = best.travel
+    ? `<div class="route-best-sub">距上車站 ${best.travel.distance_km} km・約 ${best.travel.est_minutes} 分鐘・${directionLabel(best.travel.direction)}</div>`
+    : '';
+  box.innerHTML = `
+    <div class="route-best-card">
+      <div class="route-best-icon">${best.icon}</div>
+      <div>
+        <div class="route-best-lbl">今日最推薦</div>
+        <div class="route-best-name">直奔 ${best.name}</div>
+        <div class="route-best-sub">可獲得 ${best.points} 積分${best.is_remote ? '（含偏鄉加碼）' : ''}</div>
+        ${travelLine}
+      </div>
+    </div>`;
+}
+
+function renderSmartRoutes(routes, totalUncollected) {
+  const el = document.getElementById('route-smart-list');
+  if (totalUncollected === 0) {
+    el.innerHTML = `<div style="text-align:center;padding:16px;color:#aaa;font-size:12px">所有站點都已收集，沒有新路線可以推薦囉！</div>`;
+    return;
+  }
+  if (!routes || !routes.length) {
+    el.innerHTML = `<div style="text-align:center;padding:16px;color:#aaa;font-size:12px">暫無建議路線</div>`;
+    return;
+  }
+  el.innerHTML = routes.map((r, idx) => `
+    <div class="route-card" data-smart-idx="${idx}">
+      <div class="route-card-hd">
+        <div>
+          <div class="route-card-title">${r.title}</div>
+          <div class="route-card-summary">${r.summary}</div>
+        </div>
+        <div class="route-card-pts">+${r.total_points}</div>
+      </div>
+      <div class="route-chips">${r.stations.map(stationChip).join('')}</div>
+      ${r.travel_summary ? `<div class="route-card-travel">🚆 ${r.travel_summary}</div>` : ''}
+    </div>
+  `).join('');
+}
+
+function renderMissionRoutes(routes) {
+  const el = document.getElementById('route-mission-list');
+  if (!routes || !routes.length) {
+    el.innerHTML = `<div style="text-align:center;padding:16px;color:#aaa;font-size:12px">目前沒有進行中的任務</div>`;
+    return;
+  }
+  el.innerHTML = routes.map(m => `
+    <div class="route-card">
+      <div class="route-card-hd">
+        <div class="route-card-title">${m.icon} ${m.title}${m.is_limited ? ' <span class="mission-limited-badge">限時</span>' : ''}</div>
+        <div class="route-card-pts">+${m.points_reward}</div>
+      </div>
+      ${m.stations.length ? `<div class="route-chips">${m.stations.map(stationChip).join('')}</div>` : ''}
+      ${m.note ? `<div class="route-mission-note">${m.note}</div>` : ''}
+    </div>
+  `).join('');
+}
+
+function renderThemedRoutes(routes) {
+  const el = document.getElementById('route-themed-list');
+  if (!routes || !routes.length) { el.innerHTML = ''; return; }
+  el.innerHTML = `<div class="route-themed-row">${routes.map(t => `
+    <div class="route-themed-card" data-themed-id="${t.id}">
+      <div class="route-themed-icon">${t.icon}</div>
+      <div class="route-themed-title">${t.title}</div>
+      <span class="route-themed-tag">${t.tag}</span>
+      <div class="route-themed-desc">${t.desc}</div>
+      <div class="route-chips">${t.stations.map(stationChip).join('')}</div>
+      ${t.all_collected
+        ? `<div class="route-done-badge">✓ 已完成此路線</div>`
+        : `<div class="route-themed-prog">
+             <div class="route-themed-prog-bar"><div class="route-themed-prog-fill" style="width:${Math.round(t.collected_count / t.total * 100)}%"></div></div>
+             <div class="route-themed-prog-txt">${t.collected_count}/${t.total}</div>
+           </div>`}
+    </div>
+  `).join('')}</div>`;
+}
+
+// ═══════════════════════════════════════════
 // Leaderboard
 // ═══════════════════════════════════════════
 async function loadLeaderboard() {
@@ -611,6 +912,13 @@ function closeScanModal() {
   // reset upload
   const fi = document.getElementById('scan-file-input');
   if (fi) fi.value = '';
+  // reset manual entry
+  const mf = document.getElementById('scan-manual-form');
+  if (mf) mf.style.display = 'none';
+  const ms = document.getElementById('scan-manual-station');
+  if (ms) ms.value = '';
+  const mfrom = document.getElementById('scan-manual-from');
+  if (mfrom) mfrom.value = '';
   closeModal('scan-modal');
 }
 
@@ -619,6 +927,7 @@ async function startCameraScan() {
   const video = document.getElementById('scan-video');
   const startBtn = document.getElementById('scan-start-btn');
   const stopBtn  = document.getElementById('scan-stop-btn');
+  const ocrBtn   = document.getElementById('scan-capture-ocr-btn');
   try {
     scanStream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 1280 } }
@@ -627,6 +936,7 @@ async function startCameraScan() {
     await video.play();
     startBtn.style.display = 'none';
     stopBtn.style.display  = '';
+    if (ocrBtn) ocrBtn.style.display = '';
     setText('scan-status-overlay', '對準車票上的 QR Code…');
     scanFrameLoop();
   } catch (e) {
@@ -641,8 +951,33 @@ function stopCameraScan() {
   if (video) { video.srcObject = null; }
   const startBtn = document.getElementById('scan-start-btn');
   const stopBtn  = document.getElementById('scan-stop-btn');
+  const ocrBtn   = document.getElementById('scan-capture-ocr-btn');
   if (startBtn) startBtn.style.display = '';
   if (stopBtn)  stopBtn.style.display  = 'none';
+  if (ocrBtn)   ocrBtn.style.display   = 'none';
+}
+
+// 相機模式下手動觸發一次性 OCR（持續每幀辨識文字成本太高，故採按需拍照）
+function captureFrameForOCR() {
+  const video  = document.getElementById('scan-video');
+  const canvas = document.getElementById('scan-canvas');
+  if (!video || !canvas) return;
+
+  // 相機畫面尚未就緒（常見於剛點開相機就立刻按下「拍照辨識文字」）
+  if (!video.videoWidth || !video.videoHeight) {
+    showScanError('相機畫面尚未就緒，請稍等一下再試一次');
+    return;
+  }
+
+  // 相機畫面解析度通常較拍照上傳低，放大 1.5 倍有助於文字辨識
+  const scale = 1.5;
+  canvas.width  = video.videoWidth * scale;
+  canvas.height = video.videoHeight * scale;
+  const ctx = canvas.getContext('2d');
+  ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+  const dataUrl = canvas.toDataURL('image/jpeg', 0.95);
+  stopCameraScan();
+  runTicketOCR(dataUrl);
 }
 
 function scanFrameLoop() {
@@ -683,12 +1018,54 @@ function handleTicketUpload(event) {
       if (code) {
         processQRData(code.data);
       } else {
-        showScanError('找不到 QR Code，請確認圖片清晰且包含 QR Code');
+        // QR 掃不到 → 改用 OCR 辨識票面文字（真實台鐵票 QR 為官方加密格式，本系統無法解析）
+        runTicketOCR(e.target.result);
       }
     };
     img.src = e.target.result;
   };
   reader.readAsDataURL(file);
+}
+
+async function runTicketOCR(dataUrl) {
+  setText('scan-status-overlay', '');
+  showScanError('找不到可辨識的 QR Code，正在改用文字辨識票面車站…');
+  const btn = document.getElementById('scan-upload-label');
+  try {
+    const result = await apiFetch('/ticket/ocr', {
+      method: 'POST',
+      body: JSON.stringify({ image_base64: dataUrl }),
+    });
+
+    if (!result.success) {
+      showScanError((result.detail || 'OCR 辨識失敗') + '，請改用下方「手動輸入車站」。');
+      openManualEntry();
+      return;
+    }
+
+    hideScanError();
+
+    const confidenceNote = result.low_confidence
+      ? '（部分文字較模糊，已用相近字判斷，請務必確認站名正確）'
+      : '';
+
+    if (result.to) {
+      // 辨識到出發＋到達站（或僅到達站）
+      scannedTicketRaw = null; // OCR 結果非 QR payload，走手動驗票格式
+      showScanResult(result.to.code, result.to.name, result.to.icon || '🚉', '台鐵', result.from?.code || null);
+      showToast(`已透過文字辨識自動帶入車站，請確認後收集印記${confidenceNote}`, true);
+    } else if (result.single) {
+      scannedTicketRaw = null;
+      showScanResult(result.single.code, result.single.name, result.single.icon || '🚉', '台鐵', null);
+      showToast('僅辨識到一個站名，已當作到達站，如方向不對請改用「手動輸入車站」修正', true);
+    } else {
+      showScanError('文字辨識未能判斷出發/到達站，請改用下方「手動輸入車站」。');
+      openManualEntry();
+    }
+  } catch (err) {
+    showScanError('文字辨識發生錯誤，請改用下方「手動輸入車站」。');
+    openManualEntry();
+  }
 }
 
 function processQRData(raw) {
@@ -723,7 +1100,7 @@ function processQRData(raw) {
   }
 
   if (!stationCode) {
-    showScanError('無法辨識此 QR Code 格式，請確認是否為台鐵車票');
+    showScanError('無法辨識此 QR Code 格式。若這是台鐵紙本車票，其 QR 為官方加密格式，本系統無法解析，請改用下方「手動輸入車站」完成集章。');
     return;
   }
 
@@ -825,3 +1202,60 @@ function showScanError(msg) {
 function hideScanError() {
   document.getElementById('scan-error').style.display = 'none';
 }
+
+// ── 手動輸入車站（備用方案：QR/OCR 皆無法判斷時）────────
+let manualEntryPopulated = false;
+
+function populateManualStationSelects() {
+  if (manualEntryPopulated) return;
+  const allStamps = appData.stamps?.stamps || [];
+  const fill = (selectId, withEmptyDefault) => {
+    const sel = document.getElementById(selectId);
+    if (!sel) return;
+    allStamps
+      .slice()
+      .sort((a, b) => a.station_name.localeCompare(b.station_name, 'zh-Hant'))
+      .forEach(st => {
+        const opt = document.createElement('option');
+        opt.value = st.station_code;
+        opt.textContent = `${st.icon || '🚉'} ${st.station_name}`;
+        sel.appendChild(opt);
+      });
+  };
+  fill('scan-manual-station');
+  fill('scan-manual-from');
+  manualEntryPopulated = true;
+}
+
+function toggleManualEntry() {
+  const form = document.getElementById('scan-manual-form');
+  if (!form) return;
+  const showing = form.style.display !== 'none';
+  if (showing) { form.style.display = 'none'; return; }
+  openManualEntry();
+}
+
+function openManualEntry() {
+  populateManualStationSelects();
+  const form = document.getElementById('scan-manual-form');
+  if (form) form.style.display = '';
+}
+
+function submitManualEntry() {
+  const toSel   = document.getElementById('scan-manual-station');
+  const fromSel = document.getElementById('scan-manual-from');
+  const toCode  = toSel?.value;
+  const fromCode = fromSel?.value || null;
+
+  if (!toCode) {
+    showScanError('請選擇到達站');
+    return;
+  }
+
+  hideScanError();
+  scannedTicketRaw = null; // 手動輸入走純站碼格式，由 stationCode 驅動驗票
+  const allStamps = appData.stamps?.stamps || [];
+  const toSt = allStamps.find(s => s.station_code === toCode);
+  showScanResult(toCode, toSt?.station_name || toCode, toSt?.icon || '🚉', '台鐵', fromCode);
+}
+
